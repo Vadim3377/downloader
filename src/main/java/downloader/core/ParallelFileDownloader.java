@@ -27,7 +27,7 @@ import java.util.concurrent.Executors;
 /**
  * Downloads files by splitting them into HTTP byte ranges and retrieving those ranges concurrently.
  *
- * Chunks are written directly to their final byte offsets in a temporary {@code .part}
+ * Chunks are written directly to their final byte offsets in a temporary part
  * file. The final output path is replaced only after size validation and optional checksum
  * validation succeed.
  */

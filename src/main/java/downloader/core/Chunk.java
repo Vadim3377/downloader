@@ -4,7 +4,7 @@ package downloader.core;
  * Represents a byte-range interval assigned to one download task.
  *
  * The interval is inclusive at both ends because HTTP Range requests use
- * the same convention: {@code Range: bytes=start-end}.
+ * the same convention:  Range: bytes=start-end.
  */
 public record Chunk(int index, long startInclusive, long endInclusive) {
     /**
