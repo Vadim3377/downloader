@@ -28,3 +28,16 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+
+target/
+.idea/
+*.iml
+*.class
+*.jar
+
+downloaded.*
+download-report.*
+my-local-file.txt
+
+*.log
+.DS_Store
