@@ -1,297 +1,282 @@
 package downloader.core;
 
-import downloader.util.ChecksumUtil;
+import downloader.util.HashUtils;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.RandomAccessFile;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
-import java.util.OptionalLong;
+import java.util.Locale;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletionService;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicLong;
 
-public class ParallelFileDownloader {
-
-    private static final int BUFFER_SIZE = 64 * 1024;
-
+public final class ParallelFileDownloader {
     private final HttpClient httpClient;
 
     public ParallelFileDownloader() {
-        this(HttpClient.newBuilder()
-                .followRedirects(HttpClient.Redirect.NORMAL)
-                .build());
+        this(HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build());
     }
 
     public ParallelFileDownloader(HttpClient httpClient) {
         this.httpClient = httpClient;
     }
 
-    public DownloadReport download(DownloadConfig config) throws IOException, InterruptedException {
-        return download(config, new NoOpProgressListener());
-    }
-
-    public DownloadReport download(DownloadConfig config, ProgressListener progressListener)
-            throws IOException, InterruptedException {
-
+    public DownloadReport download(DownloadConfig config) throws DownloadException, InterruptedException {
         Instant startedAt = Instant.now();
-        long startedNanos = System.nanoTime();
-
         URI uri = URI.create(config.url());
-        DownloadMetadata metadata = fetchMetadata(uri, config);
+        DownloadMetadata metadata = fetchMetadata(uri, config.requestTimeout());
 
         if (!metadata.acceptsRanges()) {
-            throw new IOException("Server does not support byte ranges: missing or invalid Accept-Ranges header");
+            throw new DownloadException("Server does not advertise byte-range support using Accept-Ranges: bytes");
         }
 
-        long fileSize = metadata.contentLength();
-        if (fileSize < 0) {
-            throw new IOException("Invalid Content-Length: " + fileSize);
-        }
-
-        if (config.outputPath().getParent() != null) {
-            Files.createDirectories(config.outputPath().getParent());
-        }
-
-        prepareOutputFile(config.outputPath(), fileSize);
-
-        List<Chunk> chunks = planChunks(fileSize, config);
-        AtomicLong downloadedBytes = new AtomicLong(0);
-
-        ExecutorService executor = Executors.newFixedThreadPool(Math.min(config.workers(), chunks.size()));
-        CompletionService<DownloadReport.ChunkReport> completionService = new ExecutorCompletionService<>(executor);
+        List<Chunk> chunks = planChunks(metadata.contentLengthBytes(), config.chunkSizeBytes());
+        Path outputPath = config.outputPath();
+        Path tempPath = outputPath.resolveSibling(outputPath.getFileName() + ".part");
 
         try {
-            for (Chunk chunk : chunks) {
-                completionService.submit(new ChunkTask(uri, config, chunk, downloadedBytes, fileSize, progressListener));
+            Path parent = outputPath.toAbsolutePath().getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
             }
 
-            List<DownloadReport.ChunkReport> chunkReports = new ArrayList<>();
+            // The .part file prevents a failed download from looking like a complete final artifact.
+            Files.deleteIfExists(tempPath);
+            preallocate(tempPath, metadata.contentLengthBytes());
 
-            for (int i = 0; i < chunks.size(); i++) {
-                try {
-                    chunkReports.add(completionService.take().get());
-                } catch (Exception e) {
-                    executor.shutdownNow();
-                    throw new IOException("Failed to download one or more chunks", e);
-                }
+            List<DownloadReport.ChunkReport> chunkReports = downloadChunks(uri, tempPath, config, chunks, metadata.contentLengthBytes());
+            validateFinalSize(tempPath, metadata.contentLengthBytes());
+
+            String actualSha256 = HashUtils.sha256(tempPath);
+            boolean checksumMatched = config.expectedSha256() == null || actualSha256.equalsIgnoreCase(config.expectedSha256());
+            if (!checksumMatched) {
+                throw new DownloadException("SHA-256 mismatch. Expected " + config.expectedSha256() + ", got " + actualSha256);
             }
 
-            verifyFinalSize(config.outputPath(), fileSize);
+            moveAtomicallyWhenPossible(tempPath, outputPath);
 
-            String sha256 = null;
-            boolean checksumVerified = false;
-
-            if (config.expectedSha256() != null && !config.expectedSha256().isBlank()) {
-                sha256 = ChecksumUtil.sha256Hex(config.outputPath());
-                checksumVerified = sha256.equalsIgnoreCase(config.expectedSha256());
-
-                if (!checksumVerified) {
-                    throw new IOException("SHA-256 mismatch. Expected " + config.expectedSha256() + ", got " + sha256);
-                }
-            } else {
-                sha256 = ChecksumUtil.sha256Hex(config.outputPath());
-            }
-
-            chunkReports.sort(Comparator.comparingInt(DownloadReport.ChunkReport::index));
-
-            Instant finishedAt = Instant.now();
-            long durationMillis = (System.nanoTime() - startedNanos) / 1_000_000;
-            int retryCount = chunkReports.stream()
-                    .mapToInt(report -> Math.max(0, report.attempts() - 1))
-                    .sum();
-
+            long downloadedBytes = chunkReports.stream().mapToLong(DownloadReport.ChunkReport::bytesWritten).sum();
             return new DownloadReport(
                     config.url(),
-                    config.outputPath(),
-                    fileSize,
+                    outputPath,
+                    metadata.contentLengthBytes(),
                     config.workers(),
+                    config.chunkSizeBytes(),
+                    config.maxRetries(),
                     chunks.size(),
-                    chunkReports.size(),
-                    retryCount,
-                    durationMillis,
-                    downloadedBytes.get(),
-                    sha256,
-                    checksumVerified,
-                    startedAt,
-                    finishedAt,
-                    List.copyOf(chunkReports)
+                    Duration.between(startedAt, Instant.now()),
+                    downloadedBytes,
+                    actualSha256,
+                    checksumMatched,
+                    chunkReports
             );
+        } catch (IOException e) {
+            throw new DownloadException("Could not write downloaded file", e);
+        } finally {
+            try {
+                Files.deleteIfExists(tempPath);
+            } catch (IOException ignored) {
+                // Best effort cleanup only: the original failure is more useful to the caller.
+            }
+        }
+    }
+
+    private DownloadMetadata fetchMetadata(URI uri, Duration timeout) throws DownloadException, InterruptedException {
+        HttpRequest request = HttpRequest.newBuilder(uri).method("HEAD", HttpRequest.BodyPublishers.noBody()).timeout(timeout).build();
+        HttpResponse<Void> response;
+        try {
+            response = httpClient.send(request, HttpResponse.BodyHandlers.discarding());
+        } catch (IOException e) {
+            throw new DownloadException("HEAD request failed", e);
+        }
+
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            throw new DownloadException("HEAD request returned HTTP " + response.statusCode());
+        }
+
+        String acceptRanges = response.headers().firstValue("Accept-Ranges").orElse("");
+        boolean acceptsRanges = acceptRanges.toLowerCase(Locale.ROOT).contains("bytes");
+        String contentLengthHeader = response.headers().firstValue("Content-Length").orElse(null);
+        if (contentLengthHeader == null) {
+            throw new DownloadException("Missing Content-Length header");
+        }
+
+        long contentLength;
+        try {
+            contentLength = Long.parseLong(contentLengthHeader);
+        } catch (NumberFormatException e) {
+            throw new DownloadException("Invalid Content-Length header: " + contentLengthHeader, e);
+        }
+
+        if (contentLength < 0) {
+            throw new DownloadException("Content-Length must not be negative");
+        }
+        return new DownloadMetadata(contentLength, acceptsRanges);
+    }
+
+    private List<Chunk> planChunks(long fileSizeBytes, long chunkSizeBytes) {
+        List<Chunk> chunks = new ArrayList<>();
+        for (long start = 0; start < fileSizeBytes; start += chunkSizeBytes) {
+            long end = Math.min(fileSizeBytes - 1, start + chunkSizeBytes - 1);
+            chunks.add(new Chunk(chunks.size(), start, end));
+        }
+        return chunks;
+    }
+
+    private void preallocate(Path path, long sizeBytes) throws IOException {
+        try (RandomAccessFile file = new RandomAccessFile(path.toFile(), "rw")) {
+            file.setLength(sizeBytes);
+        }
+    }
+
+    private List<DownloadReport.ChunkReport> downloadChunks(
+            URI uri,
+            Path tempPath,
+            DownloadConfig config,
+            List<Chunk> chunks,
+            long totalSizeBytes
+    ) throws DownloadException, InterruptedException {
+        ExecutorService executor = Executors.newFixedThreadPool(config.workers());
+        CompletionService<DownloadReport.ChunkReport> completionService = new ExecutorCompletionService<>(executor);
+        try {
+            for (Chunk chunk : chunks) {
+                completionService.submit(new ChunkTask(uri, tempPath, config, chunk, totalSizeBytes));
+            }
+
+            List<DownloadReport.ChunkReport> reports = new ArrayList<>();
+            for (int i = 0; i < chunks.size(); i++) {
+                try {
+                    reports.add(completionService.take().get());
+                } catch (ExecutionException e) {
+                    executor.shutdownNow();
+                    Throwable cause = e.getCause();
+                    if (cause instanceof DownloadException downloadException) {
+                        throw downloadException;
+                    }
+                    throw new DownloadException("Chunk download failed", cause);
+                }
+            }
+
+            reports.sort(Comparator.comparingInt(DownloadReport.ChunkReport::index));
+            return List.copyOf(reports);
         } finally {
             executor.shutdownNow();
         }
     }
 
-    private DownloadMetadata fetchMetadata(URI uri, DownloadConfig config) throws IOException, InterruptedException {
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(uri)
-                .timeout(config.requestTimeout())
-                .method("HEAD", HttpRequest.BodyPublishers.noBody())
-                .build();
-
-        HttpResponse<Void> response = httpClient.send(request, HttpResponse.BodyHandlers.discarding());
-
-        if (response.statusCode() < 200 || response.statusCode() >= 300) {
-            throw new IOException("HEAD request failed with status " + response.statusCode());
-        }
-
-        OptionalLong contentLength = response.headers().firstValueAsLong("Content-Length");
-        if (contentLength.isEmpty()) {
-            throw new IOException("Missing Content-Length header");
-        }
-
-        boolean acceptsRanges = response.headers()
-                .firstValue("Accept-Ranges")
-                .map(value -> value.equalsIgnoreCase("bytes"))
-                .orElse(false);
-
-        return new DownloadMetadata(contentLength.getAsLong(), acceptsRanges);
-    }
-
-    private void prepareOutputFile(java.nio.file.Path outputPath, long fileSize) throws IOException {
-        try (RandomAccessFile file = new RandomAccessFile(outputPath.toFile(), "rw")) {
-            file.setLength(fileSize);
+    private void validateFinalSize(Path path, long expectedSizeBytes) throws IOException, DownloadException {
+        long actualSizeBytes = Files.size(path);
+        if (actualSizeBytes != expectedSizeBytes) {
+            throw new DownloadException("Invalid final size. Expected " + expectedSizeBytes + " bytes, got " + actualSizeBytes);
         }
     }
 
-    private List<Chunk> planChunks(long fileSize, DownloadConfig config) {
-        List<Chunk> chunks = new ArrayList<>();
-
-        if (fileSize == 0) {
-            return chunks;
-        }
-
-        long chunkSize = config.chunkSizeBytes() != null
-                ? config.chunkSizeBytes()
-                : Math.max(1, (fileSize + config.workers() - 1) / config.workers());
-
-        int index = 0;
-        for (long start = 0; start < fileSize; start += chunkSize) {
-            long end = Math.min(fileSize - 1, start + chunkSize - 1);
-            chunks.add(new Chunk(index++, start, end));
-        }
-
-        return chunks;
-    }
-
-    private void verifyFinalSize(java.nio.file.Path outputPath, long expectedSize) throws IOException {
-        long actualSize = Files.size(outputPath);
-        if (actualSize != expectedSize) {
-            throw new IOException("Output size mismatch. Expected " + expectedSize + ", got " + actualSize);
+    private void moveAtomicallyWhenPossible(Path source, Path target) throws IOException {
+        try {
+            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException atomicMoveFailed) {
+            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
         }
     }
 
     private final class ChunkTask implements Callable<DownloadReport.ChunkReport> {
         private final URI uri;
+        private final Path tempPath;
         private final DownloadConfig config;
         private final Chunk chunk;
-        private final AtomicLong downloadedBytes;
-        private final long totalBytes;
-        private final ProgressListener progressListener;
+        private final long totalSizeBytes;
 
-        private ChunkTask(
-                URI uri,
-                DownloadConfig config,
-                Chunk chunk,
-                AtomicLong downloadedBytes,
-                long totalBytes,
-                ProgressListener progressListener
-        ) {
+        private ChunkTask(URI uri, Path tempPath, DownloadConfig config, Chunk chunk, long totalSizeBytes) {
             this.uri = uri;
+            this.tempPath = tempPath;
             this.config = config;
             this.chunk = chunk;
-            this.downloadedBytes = downloadedBytes;
-            this.totalBytes = totalBytes;
-            this.progressListener = progressListener;
+            this.totalSizeBytes = totalSizeBytes;
         }
 
         @Override
-        public DownloadReport.ChunkReport call() throws Exception {
-            long started = System.nanoTime();
+        public DownloadReport.ChunkReport call() throws DownloadException, InterruptedException {
+            Instant startedAt = Instant.now();
             int attempts = 0;
-            IOException lastException = null;
+            IOException lastIoException = null;
 
             while (attempts <= config.maxRetries()) {
                 attempts++;
-
                 try {
-                    long bytesWritten = downloadChunkOnce();
-                    long durationMillis = (System.nanoTime() - started) / 1_000_000;
+                    byte[] data = fetchChunk();
+                    if (data.length != chunk.sizeBytes()) {
+                        throw new IOException("Chunk " + chunk.index() + " returned " + data.length
+                                + " bytes instead of " + chunk.sizeBytes());
+                    }
+                    writeChunk(data);
                     return new DownloadReport.ChunkReport(
                             chunk.index(),
                             chunk.startInclusive(),
                             chunk.endInclusive(),
+                            data.length,
                             attempts,
-                            bytesWritten,
-                            durationMillis
+                            Duration.between(startedAt, Instant.now())
                     );
                 } catch (IOException e) {
-                    lastException = e;
+                    lastIoException = e;
                     if (attempts > config.maxRetries()) {
                         break;
                     }
-
-                    long backoffMillis = Math.min(1000, 100L * attempts);
-                    Thread.sleep(backoffMillis);
                 }
             }
 
-            throw lastException == null
-                    ? new IOException("Chunk download failed")
-                    : lastException;
+            throw new DownloadException("Chunk " + chunk.index() + " failed after " + attempts + " attempt(s)", lastIoException);
         }
 
-        private long downloadChunkOnce() throws IOException, InterruptedException {
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(uri)
-                    .timeout(config.requestTimeout())
+        private byte[] fetchChunk() throws IOException, InterruptedException, DownloadException {
+            String range = "bytes=" + chunk.startInclusive() + "-" + chunk.endInclusive();
+            HttpRequest request = HttpRequest.newBuilder(uri)
                     .GET()
-                    .header("Range", chunk.rangeHeaderValue())
+                    .timeout(config.requestTimeout())
+                    .header("Range", range)
                     .build();
 
-            HttpResponse<InputStream> response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
-
+            HttpResponse<byte[]> response = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
             if (response.statusCode() != 206) {
-                throw new IOException("Expected 206 Partial Content for " + chunk.rangeHeaderValue()
-                        + ", got " + response.statusCode());
+                throw new IOException("Expected HTTP 206 for range " + range + ", got HTTP " + response.statusCode());
             }
 
-            long expectedSize = chunk.size();
-            long bytesWritten = 0;
+            // Content-Range proves that the server returned the exact interval requested, not merely any 206 response.
+            validateContentRange(response, chunk, totalSizeBytes);
+            return response.body();
+        }
 
-            try (InputStream inputStream = response.body();
-                 RandomAccessFile outputFile = new RandomAccessFile(config.outputPath().toFile(), "rw")) {
-
-                outputFile.seek(chunk.startInclusive());
-
-                byte[] buffer = new byte[BUFFER_SIZE];
-                int read;
-
-                while ((read = inputStream.read(buffer)) != -1) {
-                    outputFile.write(buffer, 0, read);
-                    bytesWritten += read;
-                    long current = downloadedBytes.addAndGet(read);
-                    progressListener.onProgress(current, totalBytes);
-                }
+        private void validateContentRange(HttpResponse<?> response, Chunk chunk, long totalSizeBytes) throws DownloadException {
+            String expected = "bytes " + chunk.startInclusive() + "-" + chunk.endInclusive() + "/" + totalSizeBytes;
+            String actual = response.headers()
+                    .firstValue("Content-Range")
+                    .orElseThrow(() -> new DownloadException("Missing Content-Range for chunk " + chunk.index()));
+            if (!expected.equals(actual)) {
+                throw new DownloadException("Invalid Content-Range for chunk " + chunk.index()
+                        + ". Expected '" + expected + "', got '" + actual + "'");
             }
+        }
 
-            if (bytesWritten != expectedSize) {
-                throw new IOException("Chunk size mismatch for " + chunk.rangeHeaderValue()
-                        + ". Expected " + expectedSize + ", got " + bytesWritten);
+        private void writeChunk(byte[] data) throws IOException {
+            // Each task writes a disjoint byte interval, so parallel writes are safe at the file-offset level.
+            try (RandomAccessFile file = new RandomAccessFile(tempPath.toFile(), "rw")) {
+                file.seek(chunk.startInclusive());
+                file.write(data);
             }
-
-            return bytesWritten;
         }
     }
 }

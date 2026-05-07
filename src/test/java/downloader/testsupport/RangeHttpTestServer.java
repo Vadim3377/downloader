@@ -1,60 +1,46 @@
 package downloader.testsupport;
 
 import com.sun.net.httpserver.Headers;
+import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
-public final class RangeHttpTestServer implements AutoCloseable {
-
+public final class RangeHttpTestServer implements Closeable {
+    private final byte[] content;
+    private final boolean acceptRanges;
+    private final boolean includeContentLength;
+    private final boolean returnOkForRange;
+    private final boolean wrongContentRange;
+    private final int failuresBeforeSuccess;
+    private final long perRequestDelayMillis;
+    private final AtomicInteger requests = new AtomicInteger();
     private final HttpServer server;
-    private final byte[] data;
-    private boolean advertiseRanges = true;
-    private boolean includeContentLength = true;
-    private boolean ignoreRangeAndReturn200 = false;
-    private int transientFailuresRemaining = 0;
-    private final AtomicInteger requestCount = new AtomicInteger();
+    private final ExecutorService executor = Executors.newCachedThreadPool();
 
-    private RangeHttpTestServer(byte[] data) throws IOException {
-        this.data = data;
-        this.server = HttpServer.create(new InetSocketAddress(0), 0);
-        this.server.createContext("/file", exchange -> {
-            try {
-                handle(exchange.getRequestMethod(), exchange.getRequestHeaders(), exchange.getResponseHeaders(), exchange);
-            } catch (Exception e) {
-                exchange.sendResponseHeaders(500, -1);
-            } finally {
-                exchange.close();
-            }
-        });
+    private RangeHttpTestServer(Builder builder) throws IOException {
+        this.content = builder.content;
+        this.acceptRanges = builder.acceptRanges;
+        this.includeContentLength = builder.includeContentLength;
+        this.returnOkForRange = builder.returnOkForRange;
+        this.wrongContentRange = builder.wrongContentRange;
+        this.failuresBeforeSuccess = builder.failuresBeforeSuccess;
+        this.perRequestDelayMillis = builder.perRequestDelayMillis;
+        this.server = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
+        this.server.createContext("/file", this::handle);
+        this.server.setExecutor(executor);
     }
 
-    public static RangeHttpTestServer create(byte[] data) throws IOException {
-        return new RangeHttpTestServer(data);
-    }
-
-    public RangeHttpTestServer withoutRanges() {
-        this.advertiseRanges = false;
-        return this;
-    }
-
-    public RangeHttpTestServer withoutContentLength() {
-        this.includeContentLength = false;
-        return this;
-    }
-
-    public RangeHttpTestServer returning200ForRange() {
-        this.ignoreRangeAndReturn200 = true;
-        return this;
-    }
-
-    public RangeHttpTestServer withTransientFailures(int count) {
-        this.transientFailuresRemaining = count;
-        return this;
+    public static Builder builder(byte[] content) {
+        return new Builder(content);
     }
 
     public String start() {
@@ -63,82 +49,130 @@ public final class RangeHttpTestServer implements AutoCloseable {
     }
 
     public int requestCount() {
-        return requestCount.get();
+        return requests.get();
     }
 
-    private void handle(String method, Headers requestHeaders, Headers responseHeaders, com.sun.net.httpserver.HttpExchange exchange)
-            throws IOException {
-
-        requestCount.incrementAndGet();
-
-        if (advertiseRanges) {
-            responseHeaders.add("Accept-Ranges", "bytes");
+    private void handle(HttpExchange exchange) throws IOException {
+        requests.incrementAndGet();
+        try {
+            if (perRequestDelayMillis > 0 && "GET".equals(exchange.getRequestMethod())) {
+                Thread.sleep(perRequestDelayMillis);
+            }
+            if ("HEAD".equals(exchange.getRequestMethod())) {
+                sendHead(exchange);
+            } else if ("GET".equals(exchange.getRequestMethod())) {
+                sendGet(exchange);
+            } else {
+                exchange.sendResponseHeaders(405, -1);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            exchange.sendResponseHeaders(500, -1);
+        } finally {
+            exchange.close();
         }
+    }
 
+    private void sendHead(HttpExchange exchange) throws IOException {
+        Headers headers = exchange.getResponseHeaders();
+        if (acceptRanges) {
+            headers.add("Accept-Ranges", "bytes");
+        }
         if (includeContentLength) {
-            responseHeaders.add("Content-Length", String.valueOf(data.length));
+            headers.add("Content-Length", String.valueOf(content.length));
         }
+        exchange.sendResponseHeaders(200, -1);
+    }
 
-        if ("HEAD".equalsIgnoreCase(method)) {
-            exchange.sendResponseHeaders(200, -1);
-            return;
-        }
-
-        if (!"GET".equalsIgnoreCase(method)) {
-            exchange.sendResponseHeaders(405, -1);
-            return;
-        }
-
-        if (transientFailuresRemaining > 0) {
-            transientFailuresRemaining--;
-            exchange.sendResponseHeaders(503, -1);
-            return;
-        }
-
-        if (ignoreRangeAndReturn200) {
-            exchange.sendResponseHeaders(200, data.length);
+    private void sendGet(HttpExchange exchange) throws IOException {
+        if (failuresBeforeSuccess > 0 && requests.get() <= failuresBeforeSuccess + 1) {
+            byte[] failure = "temporary failure".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(503, failure.length);
             try (OutputStream outputStream = exchange.getResponseBody()) {
-                outputStream.write(data);
+                outputStream.write(failure);
             }
             return;
         }
 
-        String rangeHeader = requestHeaders.getFirst("Range");
-
-        if (rangeHeader == null || !rangeHeader.startsWith("bytes=")) {
+        String range = exchange.getRequestHeaders().getFirst("Range");
+        if (range == null || !range.startsWith("bytes=")) {
             exchange.sendResponseHeaders(400, -1);
             return;
         }
 
-        Range range = parseRange(rangeHeader, data.length);
-        byte[] chunk = Arrays.copyOfRange(data, (int) range.start(), (int) range.end() + 1);
+        String[] parts = range.substring("bytes=".length()).split("-", 2);
+        int start = Integer.parseInt(parts[0]);
+        int end = Integer.parseInt(parts[1]);
+        byte[] response = Arrays.copyOfRange(content, start, end + 1);
 
-        responseHeaders.add("Content-Range", "bytes " + range.start() + "-" + range.end() + "/" + data.length);
-        exchange.sendResponseHeaders(206, chunk.length);
+        Headers headers = exchange.getResponseHeaders();
+        headers.add("Accept-Ranges", "bytes");
+        String contentRange = wrongContentRange ? "bytes 0-" + (response.length - 1) + "/" + content.length
+                : "bytes " + start + "-" + end + "/" + content.length;
+        headers.add("Content-Range", contentRange);
+        headers.add("Content-Length", String.valueOf(response.length));
 
+        if (returnOkForRange) {
+            exchange.sendResponseHeaders(200, response.length);
+        } else {
+            exchange.sendResponseHeaders(206, response.length);
+        }
         try (OutputStream outputStream = exchange.getResponseBody()) {
-            outputStream.write(chunk);
+            outputStream.write(response);
         }
-    }
-
-    private Range parseRange(String header, int fileSize) {
-        String value = header.substring("bytes=".length());
-        String[] parts = value.split("-");
-        long start = Long.parseLong(parts[0]);
-        long end = Long.parseLong(parts[1]);
-
-        if (start < 0 || end >= fileSize || start > end) {
-            throw new IllegalArgumentException("Invalid range: " + header);
-        }
-
-        return new Range(start, end);
     }
 
     @Override
     public void close() {
         server.stop(0);
+        executor.shutdownNow();
     }
 
-    private record Range(long start, long end) {
+    public static final class Builder {
+        private final byte[] content;
+        private boolean acceptRanges = true;
+        private boolean includeContentLength = true;
+        private boolean returnOkForRange;
+        private boolean wrongContentRange;
+        private int failuresBeforeSuccess;
+        private long perRequestDelayMillis;
+
+        private Builder(byte[] content) {
+            this.content = content;
+        }
+
+        public Builder acceptRanges(boolean acceptRanges) {
+            this.acceptRanges = acceptRanges;
+            return this;
+        }
+
+        public Builder includeContentLength(boolean includeContentLength) {
+            this.includeContentLength = includeContentLength;
+            return this;
+        }
+
+        public Builder returnOkForRange(boolean returnOkForRange) {
+            this.returnOkForRange = returnOkForRange;
+            return this;
+        }
+
+        public Builder wrongContentRange(boolean wrongContentRange) {
+            this.wrongContentRange = wrongContentRange;
+            return this;
+        }
+
+        public Builder failuresBeforeSuccess(int failuresBeforeSuccess) {
+            this.failuresBeforeSuccess = failuresBeforeSuccess;
+            return this;
+        }
+
+        public Builder perRequestDelayMillis(long perRequestDelayMillis) {
+            this.perRequestDelayMillis = perRequestDelayMillis;
+            return this;
+        }
+
+        public RangeHttpTestServer build() throws IOException {
+            return new RangeHttpTestServer(this);
+        }
     }
 }

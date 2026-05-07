@@ -1,4 +1,4 @@
 package downloader.core;
 
-public record DownloadMetadata(long contentLength, boolean acceptsRanges) {
+public record DownloadMetadata(long contentLengthBytes, boolean acceptsRanges) {
 }

@@ -1,7 +1,7 @@
 package downloader.core;
 
 import java.nio.file.Path;
-import java.time.Instant;
+import java.time.Duration;
 import java.util.List;
 
 public record DownloadReport(
@@ -9,24 +9,22 @@ public record DownloadReport(
         Path outputPath,
         long fileSizeBytes,
         int workers,
-        int chunksTotal,
-        int chunksSucceeded,
-        int chunksRetried,
-        long durationMillis,
+        long chunkSizeBytes,
+        int maxRetries,
+        int chunkCount,
+        Duration duration,
         long downloadedBytes,
         String sha256,
-        boolean checksumVerified,
-        Instant startedAt,
-        Instant finishedAt,
-        List<ChunkReport> chunkReports
+        boolean checksumMatched,
+        List<ChunkReport> chunks
 ) {
     public record ChunkReport(
             int index,
             long startInclusive,
             long endInclusive,
-            int attempts,
             long bytesWritten,
-            long durationMillis
+            int attempts,
+            Duration duration
     ) {
     }
 }
