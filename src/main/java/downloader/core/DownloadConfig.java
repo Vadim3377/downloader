@@ -4,6 +4,13 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Objects;
 
+/**
+ * Immutable configuration for a single parallel download.
+ *
+ * <p>The downloader expects the remote server to support HTTP byte ranges and
+ * to expose both {@code Accept-Ranges: bytes} and {@code Content-Length} in
+ * response to a HEAD request.</p>
+ */
 public record DownloadConfig(
         String url,
         Path outputPath,
@@ -22,6 +29,9 @@ public record DownloadConfig(
         Objects.requireNonNull(url, "url");
         Objects.requireNonNull(outputPath, "outputPath");
         Objects.requireNonNull(requestTimeout, "requestTimeout");
+
+        // Validate configuration early so downloader failures are caused by I/O or server behaviour,
+        // not by invalid local settings discovered halfway through the download.
         if (url.isBlank()) {
             throw new IllegalArgumentException("url must not be blank");
         }
@@ -43,6 +53,9 @@ public record DownloadConfig(
         return new Builder();
     }
 
+    /**
+     * Builder with safe defaults for a normal local or remote download.
+     */
     public static final class Builder {
         private String url;
         private Path outputPath;
@@ -72,6 +85,12 @@ public record DownloadConfig(
             return this;
         }
 
+        /**
+         * Sets how many retries are allowed after the first failed attempt.
+         *
+         * <p>For example, {@code maxRetries = 3} allows up to four total
+         * attempts for an individual chunk.</p>
+         */
         public Builder maxRetries(int maxRetries) {
             this.maxRetries = maxRetries;
             return this;
@@ -82,6 +101,12 @@ public record DownloadConfig(
             return this;
         }
 
+        /**
+         * Optional expected SHA-256 hash of the completed file.
+         *
+         * <p>If provided, the downloader verifies the temporary file before it
+         * replaces the final output path.</p>
+         */
         public Builder expectedSha256(String expectedSha256) {
             this.expectedSha256 = expectedSha256;
             return this;

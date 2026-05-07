@@ -24,17 +24,40 @@ import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+/**
+ * Downloads files by splitting them into HTTP byte ranges and retrieving those ranges concurrently.
+ *
+ * <p>Chunks are written directly to their final byte offsets in a temporary {@code .part}
+ * file. The final output path is replaced only after size validation and optional checksum
+ * validation succeed.</p>
+ */
 public final class ParallelFileDownloader {
     private final HttpClient httpClient;
 
+    /**
+     * Creates a downloader using the JDK HTTP client and normal redirect handling.
+     */
     public ParallelFileDownloader() {
         this(HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build());
     }
 
+    /**
+     * Creates a downloader with an injected HTTP client.
+     *
+     * <p>This constructor is useful for tests and for callers that need custom HTTP client
+     * configuration.</p>
+     */
     public ParallelFileDownloader(HttpClient httpClient) {
         this.httpClient = httpClient;
     }
 
+    /**
+     * Downloads a remote file according to the supplied configuration.
+     *
+     * @return structured diagnostics for the completed download
+     * @throws DownloadException if the server does not support ranges, a chunk fails, or validation fails
+     * @throws InterruptedException if the calling thread is interrupted while waiting for HTTP or worker tasks
+     */
     public DownloadReport download(DownloadConfig config) throws DownloadException, InterruptedException {
         Instant startedAt = Instant.now();
         URI uri = URI.create(config.url());
@@ -61,6 +84,7 @@ public final class ParallelFileDownloader {
             List<DownloadReport.ChunkReport> chunkReports = downloadChunks(uri, tempPath, config, chunks, metadata.contentLengthBytes());
             validateFinalSize(tempPath, metadata.contentLengthBytes());
 
+            // Hash the temporary file before publishing it as the final output.
             String actualSha256 = HashUtils.sha256(tempPath);
             boolean checksumMatched = config.expectedSha256() == null || actualSha256.equalsIgnoreCase(config.expectedSha256());
             if (!checksumMatched) {
@@ -95,6 +119,9 @@ public final class ParallelFileDownloader {
         }
     }
 
+    /**
+     * Uses HEAD to discover the file size and whether the server claims byte-range support.
+     */
     private DownloadMetadata fetchMetadata(URI uri, Duration timeout) throws DownloadException, InterruptedException {
         HttpRequest request = HttpRequest.newBuilder(uri).method("HEAD", HttpRequest.BodyPublishers.noBody()).timeout(timeout).build();
         HttpResponse<Void> response;
@@ -128,6 +155,9 @@ public final class ParallelFileDownloader {
         return new DownloadMetadata(contentLength, acceptsRanges);
     }
 
+    /**
+     * Converts the total file size into inclusive byte ranges for HTTP Range requests.
+     */
     private List<Chunk> planChunks(long fileSizeBytes, long chunkSizeBytes) {
         List<Chunk> chunks = new ArrayList<>();
         for (long start = 0; start < fileSizeBytes; start += chunkSizeBytes) {
@@ -137,12 +167,18 @@ public final class ParallelFileDownloader {
         return chunks;
     }
 
+    /**
+     * Preallocates the temporary file so each worker can write directly at its target offset.
+     */
     private void preallocate(Path path, long sizeBytes) throws IOException {
         try (RandomAccessFile file = new RandomAccessFile(path.toFile(), "rw")) {
             file.setLength(sizeBytes);
         }
     }
 
+    /**
+     * Submits all chunk tasks and waits until each range has either completed or one task fails.
+     */
     private List<DownloadReport.ChunkReport> downloadChunks(
             URI uri,
             Path tempPath,
@@ -171,6 +207,7 @@ public final class ParallelFileDownloader {
                 }
             }
 
+            // Completion order is non-deterministic, so sort reports before returning them.
             reports.sort(Comparator.comparingInt(DownloadReport.ChunkReport::index));
             return List.copyOf(reports);
         } finally {
@@ -185,6 +222,9 @@ public final class ParallelFileDownloader {
         }
     }
 
+    /**
+     * Prefers an atomic replacement, but falls back for file systems that do not support ATOMIC_MOVE.
+     */
     private void moveAtomicallyWhenPossible(Path source, Path target) throws IOException {
         try {
             Files.move(source, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
@@ -193,6 +233,9 @@ public final class ParallelFileDownloader {
         }
     }
 
+    /**
+     * Downloads and writes one assigned byte range.
+     */
     private final class ChunkTask implements Callable<DownloadReport.ChunkReport> {
         private final URI uri;
         private final Path tempPath;
@@ -214,6 +257,8 @@ public final class ParallelFileDownloader {
             int attempts = 0;
             IOException lastIoException = null;
 
+            // maxRetries means additional attempts after the first try.
+            // Example: maxRetries = 3 allows up to 4 total attempts.
             while (attempts <= config.maxRetries()) {
                 attempts++;
                 try {
