@@ -1,0 +1,5 @@
+downloader\testsupport\RangeHttpTestServer$Range.class
+downloader\validation\PiiPatternDetectorTest.class
+downloader\testsupport\RangeHttpTestServer.class
+downloader\core\ParallelFileDownloaderTest.class
+downloader\util\SizeParserTest.class

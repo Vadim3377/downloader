@@ -1,0 +1,37 @@
+{
+  "url" : "http://localhost:8080/my-local-file.txt",
+  "outputPath" : "downloaded.txt",
+  "fileSizeBytes" : 5,
+  "workers" : 4,
+  "chunksTotal" : 3,
+  "chunksSucceeded" : 3,
+  "chunksRetried" : 0,
+  "durationMillis" : 136,
+  "downloadedBytes" : 5,
+  "sha256" : "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+  "checksumVerified" : false,
+  "startedAt" : "2026-05-06T19:05:08.485800700Z",
+  "finishedAt" : "2026-05-06T19:05:08.622925700Z",
+  "chunkReports" : [ {
+    "index" : 0,
+    "startInclusive" : 0,
+    "endInclusive" : 1,
+    "attempts" : 1,
+    "bytesWritten" : 2,
+    "durationMillis" : 41
+  }, {
+    "index" : 1,
+    "startInclusive" : 2,
+    "endInclusive" : 3,
+    "attempts" : 1,
+    "bytesWritten" : 2,
+    "durationMillis" : 38
+  }, {
+    "index" : 2,
+    "startInclusive" : 4,
+    "endInclusive" : 4,
+    "attempts" : 1,
+    "bytesWritten" : 1,
+    "durationMillis" : 40
+  } ]
+}
