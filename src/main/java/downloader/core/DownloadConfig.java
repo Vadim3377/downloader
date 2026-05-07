@@ -7,7 +7,7 @@ import java.util.Objects;
 /**
  * Immutable configuration for a single parallel download.
  *
- * <p>The downloader expects the remote server to support HTTP byte ranges and
+ * The downloader expects the remote server to support HTTP byte ranges and
  * to expose both {@code Accept-Ranges: bytes} and {@code Content-Length} in
  * response to a HEAD request.</p>
  */

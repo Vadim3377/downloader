@@ -27,9 +27,9 @@ import java.util.concurrent.Executors;
 /**
  * Downloads files by splitting them into HTTP byte ranges and retrieving those ranges concurrently.
  *
- * <p>Chunks are written directly to their final byte offsets in a temporary {@code .part}
+ * Chunks are written directly to their final byte offsets in a temporary {@code .part}
  * file. The final output path is replaced only after size validation and optional checksum
- * validation succeed.</p>
+ * validation succeed.
  */
 public final class ParallelFileDownloader {
     private final HttpClient httpClient;
@@ -44,8 +44,8 @@ public final class ParallelFileDownloader {
     /**
      * Creates a downloader with an injected HTTP client.
      *
-     * <p>This constructor is useful for tests and for callers that need custom HTTP client
-     * configuration.</p>
+     * This constructor is useful for tests and for callers that need custom HTTP client
+     * configuration.
      */
     public ParallelFileDownloader(HttpClient httpClient) {
         this.httpClient = httpClient;

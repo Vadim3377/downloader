@@ -3,8 +3,8 @@ package downloader.core;
 /**
  * Receives progress updates from a download implementation.
  *
- * <p>Implementations should be thread-safe if they are invoked from worker
- * threads in a parallel downloader.</p>
+ * Implementations should be thread-safe if they are invoked from worker
+ * threads in a parallel downloader.
  */
 @FunctionalInterface
 public interface ProgressListener {

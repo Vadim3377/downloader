@@ -7,8 +7,8 @@ import java.util.List;
 /**
  * Structured diagnostics for a completed download.
  *
- * <p>The report is suitable for JSON or Markdown output and includes both
- * global download information and per-chunk timing/attempt data.</p>
+ * The report is suitable for JSON or Markdown output and includes both
+ * global download information and per-chunk timing/attempt data.
  */
 public record DownloadReport(
         String url,
